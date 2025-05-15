@@ -1,0 +1,226 @@
+// ==UserScript==
+// @name         Replace All RGB Styles on Agile Studio with Color Rotation
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Replaces rgb(58, 83, 233) with a rotating set of colors and fixes gradients on agilestudio.pega.com
+// @author       Navaneeth Sen
+// @match        https://agilestudio.pega.com/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const OLD_COLOR = 'rgb(58, 83, 233)';
+
+    // Array of colors to cycle through
+    const COLOR_OPTIONS = [
+        'rgb(17, 38, 164)',  // Blue
+        'rgb(164, 17, 113)', // Pink/purple
+        'rgb(124, 13, 64)',  // Dark red
+        'rgb(9, 113, 113)',  // Teal
+        'rgb(136, 88, 17)'   // Gold/brown
+    ];
+
+    // Get the current color index from localStorage or set to 0 if not found
+    let currentColorIndex = parseInt(localStorage.getItem('agileStudioColorIndex') || '0');
+
+    // Get the next color and increment the index
+    const NEW_COLOR = COLOR_OPTIONS[currentColorIndex];
+    currentColorIndex = (currentColorIndex + 1) % COLOR_OPTIONS.length;
+
+    // Save the next index for the next page load
+    localStorage.setItem('agileStudioColorIndex', currentColorIndex.toString());
+
+    // Parse RGB components from the NEW_COLOR
+    const rgbMatch = NEW_COLOR.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+    let r = parseInt(rgbMatch[1]);
+    let g = parseInt(rgbMatch[2]);
+    let b = parseInt(rgbMatch[3]);
+
+    // Create a lighter version for gradients (increase each RGB component by 70%, capped at 255)
+    const LIGHT_COLOR = `rgb(${Math.min(255, Math.round(r * 1.7))}, ${Math.min(255, Math.round(g * 1.7))}, ${Math.min(255, Math.round(b * 1.7))})`;
+
+    // Log the colors being used (for debugging)
+    console.log('Agile Studio Color Replacer: Using color', NEW_COLOR, 'with light variant', LIGHT_COLOR);
+
+    // To store the classes we've found that have a linear gradient with OLD_COLOR
+    let gradientClassesFound = new Set();
+
+    function replaceColorInString(str) {
+        return str.replaceAll(OLD_COLOR, NEW_COLOR);
+    }
+
+    function replaceInlineAndComputedStyles() {
+        const allElements = document.querySelectorAll('*');
+        allElements.forEach(el => {
+            const style = getComputedStyle(el);
+            // Direct color properties
+            if (style.color === OLD_COLOR) el.style.color = NEW_COLOR;
+            if (style.backgroundColor === OLD_COLOR) el.style.backgroundColor = NEW_COLOR;
+            // Gradient backgrounds or similar
+            if (style.backgroundImage.includes(OLD_COLOR)) {
+                el.style.backgroundImage = replaceColorInString(style.backgroundImage);
+            }
+        });
+    }
+
+    function replaceInCSSRules() {
+        for (const sheet of document.styleSheets) {
+            let rules;
+            try {
+                rules = sheet.cssRules;
+            } catch (e) {
+                // Likely a cross-origin stylesheet – skip
+                continue;
+            }
+            if (!rules) continue;
+            for (let i = 0; i < rules.length; i++) {
+                const rule = rules[i];
+                if (rule.style) {
+                    for (let j = 0; j < rule.style.length; j++) {
+                        const prop = rule.style[j];
+                        const value = rule.style.getPropertyValue(prop);
+                        if (value.includes(OLD_COLOR)) {
+                            const newValue = replaceColorInString(value);
+                            rule.style.setProperty(prop, newValue, rule.style.getPropertyPriority(prop));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Find classes that have a linear gradient with OLD_COLOR and store them
+    function findClassesWithGradient() {
+        // Get all stylesheet rules
+        const allRules = [];
+        for (const sheet of document.styleSheets) {
+            try {
+                for (const rule of sheet.cssRules || []) {
+                    allRules.push(rule);
+                }
+            } catch (e) {
+                // Skip cross-origin sheets
+                continue;
+            }
+        }
+
+        // Look for style rules with linear gradients containing OLD_COLOR
+        allRules.forEach(rule => {
+            if (rule.type === CSSRule.STYLE_RULE) {
+                const selectorText = rule.selectorText;
+                if (!selectorText) return;
+
+                // Look for background or background-image with linear-gradient and OLD_COLOR
+                const background = rule.style.background || '';
+                const backgroundImage = rule.style.backgroundImage || '';
+
+                const hasOldColorGradient =
+                    (background.includes('linear-gradient') && background.includes(OLD_COLOR)) ||
+                    (backgroundImage.includes('linear-gradient') && backgroundImage.includes(OLD_COLOR));
+
+                if (hasOldColorGradient) {
+                    // Extract class names from the selector
+                    const classMatches = selectorText.match(/\.[a-zA-Z0-9_-]+/g);
+                    if (classMatches) {
+                        classMatches.forEach(className => {
+                            // Remove the dot at the beginning
+                            const cls = className.substring(1);
+                            gradientClassesFound.add(cls);
+                        });
+                    }
+                }
+            }
+        });
+
+        console.log('Found classes with gradients:', Array.from(gradientClassesFound));
+    }
+
+    // Apply new gradient to elements with a specific class
+    function applyGradientToClass(className) {
+        if (!className) return;
+
+        const elements = document.querySelectorAll('.' + className);
+        elements.forEach(el => {
+            el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+        });
+    }
+
+    // Apply gradients to all classes with gradients
+    function applyGradientToAllFoundClasses() {
+        gradientClassesFound.forEach(className => {
+            applyGradientToClass(className);
+        });
+    }
+
+    // Extract classes from the case-view header and check if they have gradients
+    function extractHeaderClassesAndStyle() {
+        // Find the header element
+        const header = document.querySelector('header[data-testid=":case-view:header"]');
+
+        if (header && header.className) {
+            // Split the class string into individual classes
+            const classes = header.className.split(/\s+/);
+
+            // Check each class to see if it's in our gradientClassesFound set
+            classes.forEach(cls => {
+                if (cls && gradientClassesFound.has(cls)) {
+                    // If this class has a gradient, apply styling
+                    applyGradientToClass(cls);
+                }
+            });
+        }
+
+        // Also directly style the header if it exists
+        if (header) {
+            header.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+        }
+    }
+
+    function applyAllReplacements() {
+        replaceInlineAndComputedStyles();
+        replaceInCSSRules();
+
+        // Find classes with gradients if we haven't done so yet
+        if (gradientClassesFound.size === 0) {
+            findClassesWithGradient();
+        }
+
+        // Apply to all gradient classes we've found
+        applyGradientToAllFoundClasses();
+
+        // Also check the header element specifically
+        extractHeaderClassesAndStyle();
+    }
+
+    // Run on initial load
+    window.addEventListener('load', applyAllReplacements);
+
+    // Also run immediately in case some elements are already loaded
+    applyAllReplacements();
+
+    // Run every 500ms for the first 5 seconds to catch dynamically loaded elements
+    for (let i = 1; i <= 10; i++) {
+        setTimeout(applyAllReplacements, i * 500);
+    }
+
+    // Watch for dynamic DOM changes
+    const observer = new MutationObserver(mutations => {
+        // Check if we need to apply styling
+        let shouldApply = false;
+
+        // Look for added nodes that might be relevant
+        mutations.forEach(mutation => {
+            if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                shouldApply = true;
+            }
+        });
+
+        if (shouldApply) {
+            applyAllReplacements();
+        }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+})();
