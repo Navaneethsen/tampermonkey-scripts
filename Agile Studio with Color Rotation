@@ -11,7 +11,9 @@
 (function () {
     'use strict';
 
-    const OLD_COLOR = 'rgb(58, 83, 233)';
+    const OLD_COLOR_RGB = 'rgb(58, 83, 233)';
+    const OLD_COLOR_RGB_PATTERN = /rgb\(58,\s*83,\s*233\)/g;
+    const OLD_COLOR_RGBA_PATTERN = /rgba\(58,\s*83,\s*233,\s*([\d.]+)\)/g;
     const OLD_GRADIENT_SECOND_COLOR = 'rgb(0, 67, 200)';
 
     // Array of colors to cycle through
@@ -39,8 +41,8 @@
     let g = parseInt(rgbMatch[2]);
     let b = parseInt(rgbMatch[3]);
 
-    // Create a lighter version for gradients (increase each RGB component by 60%, capped at 255)
-    const LIGHT_COLOR = `rgb(${Math.min(255, Math.round(r * 1.6))}, ${Math.min(255, Math.round(g * 1.6))}, ${Math.min(255, Math.round(b * 1.6))})`;
+    // Create a lighter version for gradients (increase each RGB component by 70%, capped at 255)
+    const LIGHT_COLOR = `rgb(${Math.min(255, Math.round(r * 1.7))}, ${Math.min(255, Math.round(g * 1.7))}, ${Math.min(255, Math.round(b * 1.7))})`;
 
     // Log the colors being used (for debugging)
     console.log('Agile Studio Color Replacer: Using color', NEW_COLOR, 'with light variant', LIGHT_COLOR);
@@ -49,56 +51,45 @@
     let gradientClassesFound = new Set();
 
     function replaceColorInString(str) {
-        return str.replaceAll(OLD_COLOR, NEW_COLOR);
+        if (!str) return str;
+
+        // Replace simple RGB color
+        let modified = str.replace(OLD_COLOR_RGB_PATTERN, NEW_COLOR);
+
+        // Replace RGBA color while preserving the alpha value
+        modified = modified.replace(OLD_COLOR_RGBA_PATTERN, (match, alpha) => {
+            // Extract r, g, b from NEW_COLOR
+            const rgbParts = NEW_COLOR.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+            if (rgbParts) {
+                return `rgba(${rgbParts[1]}, ${rgbParts[2]}, ${rgbParts[3]}, ${alpha})`;
+            }
+            return match; // Fallback if NEW_COLOR is in an unexpected format
+        });
+
+        return modified;
     }
 
     function replaceInlineAndComputedStyles() {
         const allElements = document.querySelectorAll('*');
         allElements.forEach(el => {
             const style = getComputedStyle(el);
-            // Direct color properties
-            if (style.color === OLD_COLOR) el.style.color = NEW_COLOR;
-            if (style.backgroundColor === OLD_COLOR) el.style.backgroundColor = NEW_COLOR;
 
-            // Check for any type of linear gradient we want to replace
-            const backgroundImage = style.backgroundImage || '';
-            if (backgroundImage.includes('linear-gradient')) {
-                // If it has our main old color
-                if (backgroundImage.includes(OLD_COLOR)) {
-                    el.style.backgroundImage = replaceColorInString(backgroundImage);
-                }
+            // Go through all style properties
+            for (const prop of style) {
+                const value = style.getPropertyValue(prop);
 
-                // If it's specifically the 4deg gradient pattern with old second color
-                if (backgroundImage.includes('4deg') && backgroundImage.includes(OLD_GRADIENT_SECOND_COLOR)) {
-                    el.style.backgroundImage = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
-                }
-
-                // Look for any element that has a 4deg linear gradient (like the article example)
-                if (backgroundImage.includes('4deg') && backgroundImage.includes('linear-gradient')) {
-                    // Extract the two colors from the gradient if possible
-                    const colorMatch = backgroundImage.match(/linear-gradient\(4deg,\s*rgb\([^)]+\)\s*50%,\s*rgb\([^)]+\)\s*100%\)/);
-                    if (colorMatch) {
-                        el.style.backgroundImage = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
-                    }
-                }
-            }
-
-            // Also check the background property
-            const background = style.background || '';
-            if (background.includes('linear-gradient')) {
-                // Same checks as above
-                if (background.includes(OLD_COLOR)) {
-                    el.style.background = replaceColorInString(background);
-                }
-
-                if (background.includes('4deg') && background.includes(OLD_GRADIENT_SECOND_COLOR)) {
-                    el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
-                }
-
-                if (background.includes('4deg') && background.includes('linear-gradient')) {
-                    const colorMatch = background.match(/linear-gradient\(4deg,\s*rgb\([^)]+\)\s*50%,\s*rgb\([^)]+\)\s*100%\)/);
-                    if (colorMatch) {
-                        el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+                // Check if this property has our target color in any form
+                if (value.includes('rgb(58') || value.includes('rgba(58')) {
+                    // Special handling for gradients
+                    if (value.includes('linear-gradient') && value.includes('4deg')) {
+                        if (prop === 'background' || prop === 'backgroundImage') {
+                            el.style[prop] = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+                        } else {
+                            el.style[prop] = replaceColorInString(value);
+                        }
+                    } else {
+                        // For non-gradient properties, just replace the color
+                        el.style[prop] = replaceColorInString(value);
                     }
                 }
             }
@@ -122,19 +113,31 @@
                         const prop = rule.style[j];
                         const value = rule.style.getPropertyValue(prop);
 
-                        if (value.includes(OLD_COLOR)) {
-                            const newValue = replaceColorInString(value);
-                            rule.style.setProperty(prop, newValue, rule.style.getPropertyPriority(prop));
-                        }
-
-                        // Also replace gradients with the second color
-                        if (value.includes('linear-gradient') && value.includes('4deg') &&
-                            (value.includes(OLD_GRADIENT_SECOND_COLOR))) {
-                            rule.style.setProperty(
-                                prop,
-                                `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`,
-                                rule.style.getPropertyPriority(prop)
-                            );
+                        // Check if this property has our target color in any form
+                        if (value.includes('rgb(58') || value.includes('rgba(58')) {
+                            // Special handling for gradients
+                            if (value.includes('linear-gradient') && value.includes('4deg')) {
+                                if (prop === 'background' || prop === 'background-image') {
+                                    rule.style.setProperty(
+                                        prop,
+                                        `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`,
+                                        rule.style.getPropertyPriority(prop)
+                                    );
+                                } else {
+                                    rule.style.setProperty(
+                                        prop,
+                                        replaceColorInString(value),
+                                        rule.style.getPropertyPriority(prop)
+                                    );
+                                }
+                            } else {
+                                // For non-gradient properties, just replace the color
+                                rule.style.setProperty(
+                                    prop,
+                                    replaceColorInString(value),
+                                    rule.style.getPropertyPriority(prop)
+                                );
+                            }
                         }
                     }
                 }
@@ -142,8 +145,8 @@
         }
     }
 
-    // Find classes with any gradient that we want to replace
-    function findClassesWithGradient() {
+    // Find classes with any color or gradient that we want to replace
+    function findClassesWithTargetColors() {
         // Get all stylesheet rules
         const allRules = [];
         for (const sheet of document.styleSheets) {
@@ -157,28 +160,25 @@
             }
         }
 
-        // Look for style rules with linear gradients containing either old color
+        // Look for style rules with our target colors
         allRules.forEach(rule => {
             if (rule.type === CSSRule.STYLE_RULE) {
                 const selectorText = rule.selectorText;
                 if (!selectorText) return;
 
-                // Check background and background-image properties
-                const background = rule.style.background || '';
-                const backgroundImage = rule.style.backgroundImage || '';
+                // Check if any style property contains our target color
+                let hasTargetColor = false;
+                for (let i = 0; i < rule.style.length; i++) {
+                    const prop = rule.style[i];
+                    const value = rule.style.getPropertyValue(prop);
 
-                const hasTargetGradient =
-                    // Either has our main old color
-                    ((background.includes('linear-gradient') && background.includes(OLD_COLOR)) ||
-                    (backgroundImage.includes('linear-gradient') && backgroundImage.includes(OLD_COLOR))) ||
-                    // Or has the second color in a 4deg gradient
-                    ((background.includes('linear-gradient') && background.includes('4deg') && background.includes(OLD_GRADIENT_SECOND_COLOR)) ||
-                    (backgroundImage.includes('linear-gradient') && backgroundImage.includes('4deg') && backgroundImage.includes(OLD_GRADIENT_SECOND_COLOR))) ||
-                    // Or just any 4deg gradient
-                    ((background.includes('linear-gradient') && background.includes('4deg')) ||
-                    (backgroundImage.includes('linear-gradient') && backgroundImage.includes('4deg')));
+                    if (value.includes('rgb(58') || value.includes('rgba(58')) {
+                        hasTargetColor = true;
+                        break;
+                    }
+                }
 
-                if (hasTargetGradient) {
+                if (hasTargetColor) {
                     // Extract class names from the selector
                     const classMatches = selectorText.match(/\.[a-zA-Z0-9_-]+/g);
                     if (classMatches) {
@@ -192,23 +192,48 @@
             }
         });
 
-        console.log('Found classes with gradients:', Array.from(gradientClassesFound));
+        console.log('Found classes with target colors:', Array.from(gradientClassesFound));
     }
 
-    // Apply new gradient to elements with a specific class
-    function applyGradientToClass(className) {
+    // Apply new styles to elements with a specific class
+    function applyStylesToClass(className) {
         if (!className) return;
 
         const elements = document.querySelectorAll('.' + className);
         elements.forEach(el => {
-            el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+            // Get computed style and check for our target properties
+            const style = getComputedStyle(el);
+
+            // Check background and gradient properties specifically
+            if ((style.background && (style.background.includes('rgb(58') || style.background.includes('rgba(58'))) ||
+                (style.backgroundImage && (style.backgroundImage.includes('rgb(58') || style.backgroundImage.includes('rgba(58')))) {
+
+                // If it's a 4deg gradient, apply our special gradient
+                if ((style.background && style.background.includes('4deg')) ||
+                    (style.backgroundImage && style.backgroundImage.includes('4deg'))) {
+                    el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+                } else {
+                    // Otherwise just replace the color
+                    if (style.background.includes('rgb(58') || style.background.includes('rgba(58')) {
+                        el.style.background = replaceColorInString(style.background);
+                    }
+                    if (style.backgroundImage.includes('rgb(58') || style.backgroundImage.includes('rgba(58')) {
+                        el.style.backgroundImage = replaceColorInString(style.backgroundImage);
+                    }
+                }
+            }
+
+            // Check for color property
+            if (style.color && (style.color.includes('rgb(58') || style.color.includes('rgba(58'))) {
+                el.style.color = replaceColorInString(style.color);
+            }
         });
     }
 
-    // Apply gradients to all classes with gradients
-    function applyGradientToAllFoundClasses() {
+    // Apply styles to all found classes
+    function applyStylesToAllFoundClasses() {
         gradientClassesFound.forEach(className => {
-            applyGradientToClass(className);
+            applyStylesToClass(className);
         });
     }
 
@@ -226,10 +251,20 @@
             el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
         });
 
-        // Also target by inline style content
+        // Also target by inline style content for gradients
         const elementsWithGradient = document.querySelectorAll('[style*="linear-gradient(4deg"]');
         elementsWithGradient.forEach(el => {
             el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+        });
+
+        // Target elements with any form of the rgb(58, 83, 233) color
+        const elementsWithColor = document.querySelectorAll('[style*="rgb(58"]');
+        elementsWithColor.forEach(el => {
+            // For each element, check its inline style string and replace color
+            if (el.style.cssText) {
+                const newCssText = replaceColorInString(el.style.cssText);
+                el.style.cssText = newCssText;
+            }
         });
     }
 
@@ -237,13 +272,13 @@
         replaceInlineAndComputedStyles();
         replaceInCSSRules();
 
-        // Find classes with gradients if we haven't done so yet
+        // Find classes with target colors if we haven't done so yet
         if (gradientClassesFound.size === 0) {
-            findClassesWithGradient();
+            findClassesWithTargetColors();
         }
 
-        // Apply to all gradient classes we've found
-        applyGradientToAllFoundClasses();
+        // Apply to all found classes
+        applyStylesToAllFoundClasses();
 
         // Also check specific elements by type or attributes
         targetSpecificElements();
