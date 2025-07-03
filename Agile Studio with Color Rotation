@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Replace All RGB Styles on Agile Studio with Color Rotation
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      2.0
 // @description  Replaces rgb(58, 83, 233) with a rotating set of colors and fixes gradients on agilestudio.pega.com
 // @author       Navaneeth Sen
 // @match        https://agilestudio.pega.com/*
@@ -14,7 +14,6 @@
     const OLD_COLOR_RGB = 'rgb(58, 83, 233)';
     const OLD_COLOR_RGB_PATTERN = /rgb\(58,\s*83,\s*233\)/g;
     const OLD_COLOR_RGBA_PATTERN = /rgba\(58,\s*83,\s*233,\s*([\d.]+)\)/g;
-    const OLD_GRADIENT_SECOND_COLOR = 'rgb(0, 67, 200)';
 
     // Array of colors to cycle through
     const COLOR_OPTIONS = [
@@ -41,14 +40,14 @@
     let g = parseInt(rgbMatch[2]);
     let b = parseInt(rgbMatch[3]);
 
-    // Create a lighter version for gradients (increase each RGB component by 70%, capped at 255)
+    // Create a lighter version for gradients
     const LIGHT_COLOR = `rgb(${Math.min(255, Math.round(r * 1.7))}, ${Math.min(255, Math.round(g * 1.7))}, ${Math.min(255, Math.round(b * 1.7))})`;
 
-    // Log the colors being used (for debugging)
     console.log('Agile Studio Color Replacer: Using color', NEW_COLOR, 'with light variant', LIGHT_COLOR);
 
-    // To store the classes we've found that have gradients we want to replace
-    let gradientClassesFound = new Set();
+    // Performance optimization: throttle and debounce
+    let isProcessing = false;
+    const processedElements = new WeakSet();
 
     function replaceColorInString(str) {
         if (!str) return str;
@@ -58,42 +57,72 @@
 
         // Replace RGBA color while preserving the alpha value
         modified = modified.replace(OLD_COLOR_RGBA_PATTERN, (match, alpha) => {
-            // Extract r, g, b from NEW_COLOR
             const rgbParts = NEW_COLOR.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
             if (rgbParts) {
                 return `rgba(${rgbParts[1]}, ${rgbParts[2]}, ${rgbParts[3]}, ${alpha})`;
             }
-            return match; // Fallback if NEW_COLOR is in an unexpected format
+            return match;
         });
 
         return modified;
     }
 
+    // Optimized inline and computed styles replacement
     function replaceInlineAndComputedStyles() {
+        // Get all elements but process in batches to avoid blocking
         const allElements = document.querySelectorAll('*');
-        allElements.forEach(el => {
-            const style = getComputedStyle(el);
+        const batchSize = 100;
 
-            // Go through all style properties
-            for (const prop of style) {
-                const value = style.getPropertyValue(prop);
+        function processBatch(startIndex) {
+            const endIndex = Math.min(startIndex + batchSize, allElements.length);
 
-                // Check if this property has our target color in any form
-                if (value.includes('rgb(58') || value.includes('rgba(58')) {
-                    // Special handling for gradients
-                    if (value.includes('linear-gradient') && value.includes('4deg')) {
-                        if (prop === 'background' || prop === 'backgroundImage') {
-                            el.style[prop] = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+            for (let i = startIndex; i < endIndex; i++) {
+                const el = allElements[i];
+
+                // Skip input elements and contenteditable to avoid typing interference
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' ||
+                    el.contentEditable === 'true' || el.isContentEditable) {
+                    continue;
+                }
+
+                // Skip if already processed in this cycle
+                if (processedElements.has(el)) {
+                    continue;
+                }
+
+                const style = getComputedStyle(el);
+
+                // Only check relevant properties that could contain our target color
+                const relevantProps = ['background', 'background-image', 'color', 'border-color', 'box-shadow'];
+
+                for (const prop of relevantProps) {
+                    const value = style.getPropertyValue(prop);
+
+                    if (value && (value.includes('rgb(58') || value.includes('rgba(58'))) {
+                        // Special handling for gradients
+                        if (value.includes('linear-gradient') && value.includes('4deg')) {
+                            if (prop === 'background' || prop === 'background-image') {
+                                el.style[prop] = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
+                            } else {
+                                el.style[prop] = replaceColorInString(value);
+                            }
                         } else {
                             el.style[prop] = replaceColorInString(value);
                         }
-                    } else {
-                        // For non-gradient properties, just replace the color
-                        el.style[prop] = replaceColorInString(value);
                     }
                 }
+
+                processedElements.add(el);
             }
-        });
+
+            // Continue with next batch if there are more elements
+            if (endIndex < allElements.length) {
+                requestAnimationFrame(() => processBatch(endIndex));
+            }
+        }
+
+        // Start processing first batch
+        processBatch(0);
     }
 
     function replaceInCSSRules() {
@@ -102,10 +131,10 @@
             try {
                 rules = sheet.cssRules;
             } catch (e) {
-                // Likely a cross-origin stylesheet – skip
                 continue;
             }
             if (!rules) continue;
+
             for (let i = 0; i < rules.length; i++) {
                 const rule = rules[i];
                 if (rule.style) {
@@ -113,9 +142,7 @@
                         const prop = rule.style[j];
                         const value = rule.style.getPropertyValue(prop);
 
-                        // Check if this property has our target color in any form
                         if (value.includes('rgb(58') || value.includes('rgba(58')) {
-                            // Special handling for gradients
                             if (value.includes('linear-gradient') && value.includes('4deg')) {
                                 if (prop === 'background' || prop === 'background-image') {
                                     rule.style.setProperty(
@@ -131,7 +158,6 @@
                                     );
                                 }
                             } else {
-                                // For non-gradient properties, just replace the color
                                 rule.style.setProperty(
                                     prop,
                                     replaceColorInString(value),
@@ -145,99 +171,7 @@
         }
     }
 
-    // Find classes with any color or gradient that we want to replace
-    function findClassesWithTargetColors() {
-        // Get all stylesheet rules
-        const allRules = [];
-        for (const sheet of document.styleSheets) {
-            try {
-                for (const rule of sheet.cssRules || []) {
-                    allRules.push(rule);
-                }
-            } catch (e) {
-                // Skip cross-origin sheets
-                continue;
-            }
-        }
-
-        // Look for style rules with our target colors
-        allRules.forEach(rule => {
-            if (rule.type === CSSRule.STYLE_RULE) {
-                const selectorText = rule.selectorText;
-                if (!selectorText) return;
-
-                // Check if any style property contains our target color
-                let hasTargetColor = false;
-                for (let i = 0; i < rule.style.length; i++) {
-                    const prop = rule.style[i];
-                    const value = rule.style.getPropertyValue(prop);
-
-                    if (value.includes('rgb(58') || value.includes('rgba(58')) {
-                        hasTargetColor = true;
-                        break;
-                    }
-                }
-
-                if (hasTargetColor) {
-                    // Extract class names from the selector
-                    const classMatches = selectorText.match(/\.[a-zA-Z0-9_-]+/g);
-                    if (classMatches) {
-                        classMatches.forEach(className => {
-                            // Remove the dot at the beginning
-                            const cls = className.substring(1);
-                            gradientClassesFound.add(cls);
-                        });
-                    }
-                }
-            }
-        });
-
-        console.log('Found classes with target colors:', Array.from(gradientClassesFound));
-    }
-
-    // Apply new styles to elements with a specific class
-    function applyStylesToClass(className) {
-        if (!className) return;
-
-        const elements = document.querySelectorAll('.' + className);
-        elements.forEach(el => {
-            // Get computed style and check for our target properties
-            const style = getComputedStyle(el);
-
-            // Check background and gradient properties specifically
-            if ((style.background && (style.background.includes('rgb(58') || style.background.includes('rgba(58'))) ||
-                (style.backgroundImage && (style.backgroundImage.includes('rgb(58') || style.backgroundImage.includes('rgba(58')))) {
-
-                // If it's a 4deg gradient, apply our special gradient
-                if ((style.background && style.background.includes('4deg')) ||
-                    (style.backgroundImage && style.backgroundImage.includes('4deg'))) {
-                    el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
-                } else {
-                    // Otherwise just replace the color
-                    if (style.background.includes('rgb(58') || style.background.includes('rgba(58')) {
-                        el.style.background = replaceColorInString(style.background);
-                    }
-                    if (style.backgroundImage.includes('rgb(58') || style.backgroundImage.includes('rgba(58')) {
-                        el.style.backgroundImage = replaceColorInString(style.backgroundImage);
-                    }
-                }
-            }
-
-            // Check for color property
-            if (style.color && (style.color.includes('rgb(58') || style.color.includes('rgba(58'))) {
-                el.style.color = replaceColorInString(style.color);
-            }
-        });
-    }
-
-    // Apply styles to all found classes
-    function applyStylesToAllFoundClasses() {
-        gradientClassesFound.forEach(className => {
-            applyStylesToClass(className);
-        });
-    }
-
-    // Also target specific element types
+    // Target specific elements (kept from original)
     function targetSpecificElements() {
         // Look for header elements
         const headers = document.querySelectorAll('header[data-testid=":case-view:header"]');
@@ -251,7 +185,7 @@
             el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
         });
 
-        // Also target by inline style content for gradients
+        // Target by inline style content for gradients
         const elementsWithGradient = document.querySelectorAll('[style*="linear-gradient(4deg"]');
         elementsWithGradient.forEach(el => {
             el.style.background = `linear-gradient(4deg, ${NEW_COLOR} 50%, ${LIGHT_COLOR} 100%)`;
@@ -260,7 +194,6 @@
         // Target elements with any form of the rgb(58, 83, 233) color
         const elementsWithColor = document.querySelectorAll('[style*="rgb(58"]');
         elementsWithColor.forEach(el => {
-            // For each element, check its inline style string and replace color
             if (el.style.cssText) {
                 const newCssText = replaceColorInString(el.style.cssText);
                 el.style.cssText = newCssText;
@@ -268,21 +201,56 @@
         });
     }
 
+    // Throttled main processing function
     function applyAllReplacements() {
-        replaceInlineAndComputedStyles();
-        replaceInCSSRules();
+        if (isProcessing) return;
 
-        // Find classes with target colors if we haven't done so yet
-        if (gradientClassesFound.size === 0) {
-            findClassesWithTargetColors();
+        isProcessing = true;
+
+        // Clear processed elements cache periodically
+        if (Math.random() < 0.1) { // 10% chance to clear cache
+            processedElements.clear?.() || Object.setPrototypeOf(processedElements, WeakSet.prototype);
         }
 
-        // Apply to all found classes
-        applyStylesToAllFoundClasses();
-
-        // Also check specific elements by type or attributes
-        targetSpecificElements();
+        // Use requestAnimationFrame to avoid blocking
+        requestAnimationFrame(() => {
+            try {
+                replaceInCSSRules();
+                targetSpecificElements();
+                replaceInlineAndComputedStyles(); // This now processes in batches
+            } finally {
+                isProcessing = false;
+            }
+        });
     }
+
+    // Optimized mutation observer with debouncing
+    let mutationTimeout;
+    const observer = new MutationObserver(mutations => {
+        let shouldProcess = false;
+
+        mutations.forEach(mutation => {
+            if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                // Check if any added nodes are elements (not text nodes)
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        shouldProcess = true;
+                        break;
+                    }
+                }
+            }
+        });
+
+        if (shouldProcess) {
+            // Debounce: clear previous timeout and set new one
+            clearTimeout(mutationTimeout);
+            mutationTimeout = setTimeout(() => {
+                applyAllReplacements();
+            }, 100); // Wait 100ms before processing
+        }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
 
     // Run on initial load
     window.addEventListener('load', applyAllReplacements);
@@ -290,27 +258,8 @@
     // Also run immediately in case some elements are already loaded
     applyAllReplacements();
 
-    // Run every 500ms for the first 5 seconds to catch dynamically loaded elements
-    for (let i = 1; i <= 10; i++) {
-        setTimeout(applyAllReplacements, i * 500);
-    }
-
-    // Watch for dynamic DOM changes
-    const observer = new MutationObserver(mutations => {
-        // Check if we need to apply styling
-        let shouldApply = false;
-
-        // Look for added nodes that might be relevant
-        mutations.forEach(mutation => {
-            if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
-                shouldApply = true;
-            }
-        });
-
-        if (shouldApply) {
-            applyAllReplacements();
-        }
-    });
-
-    observer.observe(document.body, { childList: true, subtree: true });
+    // Reduced frequency polling - only 3 times instead of 10
+    setTimeout(applyAllReplacements, 1000);
+    setTimeout(applyAllReplacements, 3000);
+    setTimeout(applyAllReplacements, 8000);
 })();
