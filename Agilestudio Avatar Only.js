@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @description  Show only avatar in the user presence div, remove text and resize
-// @author       You
+// @author       Navaneeth Sen
 // @match        https://agilestudio.pega.com/prweb/AgileStudio/app/agilestudio/*
 // @grant        none
 // @run-at       document-idle
