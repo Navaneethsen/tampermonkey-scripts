@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Pega Strategy Canvas Auto-Layout
-// @namespace    senn1.pega.tools
+// @namespace    navaneethsen@gmail.com
 // @version      1.0
 // @description  Adds hierarchical / tree layout buttons to the Pega strategy canvas (Dev Studio)
 // @match        http://localhost:18080/prweb/*
