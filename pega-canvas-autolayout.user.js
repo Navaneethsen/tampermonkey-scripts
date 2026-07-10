@@ -3,7 +3,7 @@
 // @namespace    navaneethsen@gmail.com
 // @version      1.0
 // @description  Adds hierarchical / tree layout buttons to the Pega strategy canvas (Dev Studio)
-// @match        http://localhost:18080/prweb/*
+// @match        *://*/prweb/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -76,190 +76,502 @@
    * Uses longest-path layering for DAGs, with cycle handling.
    */
   function applyHierarchicalLayout(graph, vertices, direction, spacing) {
-    console.log('[applyHierarchicalLayout] Direction:', direction, 'Spacing:', spacing);
+    return applyCompound(graph, vertices, direction, spacing, computeLayeredPositions, 'Hierarchical layout');
+  }
 
-    if (vertices.length === 0) {
-      return { success: false, message: 'No vertices to arrange' };
-    }
+  /**
+   * Size-aware layered (Sugiyama-lite) layout.
+   *
+   * Works in an abstract (layerAxis, crossAxis) space so vertical/horizontal
+   * share one code path:
+   *   horizontal flow -> layerAxis = X (depth), crossAxis = Y (siblings)
+   *   vertical   flow -> layerAxis = Y (depth), crossAxis = X (siblings)
+   *
+   * Fixes over the old barycenter version, which fell apart when a canvas
+   * mixed 270x240 shapes with 60px ones:
+   *   1. Longest-path layering via proper topological order (cycle-safe).
+   *   2. Ordering by MEDIAN of neighbour order (down+up sweeps) to cut crossings.
+   *   3. Coordinate assignment in PIXEL space:
+   *        - cross positions start packed by node size (no overlap by
+   *          construction, whatever the size mix),
+   *        - then each node is pulled toward the median of its neighbours'
+   *          cross-centres and a separation sweep re-imposes the min gap,
+   *          which straightens edges without ever letting big shapes collide.
+   *   4. Layer depth advances by the max node size IN THAT LAYER, so a fat
+   *      layer never overlaps the next.
+   *
+   * Exposed on window.__pcalCompute so it can be unit-tested off-DOM.
+   */
+  function computeLayeredPositions(nodes, edges, opts) {
+    // nodes: [{id, w, h}], edges: [{source, target}]
+    // returns { positions: {id:{x,y}}, layers, bounds:{minX,minY,maxX,maxY} }
+    opts = opts || {};
+    var isVertical = opts.direction === 'vertical';
+    var spacing = opts.spacing || 60;
+    var layerGap = spacing * 1.5;   // gap between layer bands (depth axis)
+    var crossGap = spacing;         // gap between siblings (cross axis)
 
-    var isVertical = direction === 'vertical';
-    var levelPadding = spacing * 1.5;
-    var siblingPadding = spacing;
+    var byId = {};
+    nodes.forEach(function (n) { byId[n.id] = n; });
 
-    var vertexById = {};
-    vertices.forEach(function (v) { vertexById[v.id] = v; });
+    // size helpers in abstract axes
+    function depthSize(n) { return isVertical ? n.h : n.w; } // along flow
+    function crossSize(n) { return isVertical ? n.w : n.h; } // perpendicular
 
-    var levels = {};
-    var maxLevel = 0;
-
-    // Roots: no incoming edges from within this vertex set
-    var roots = vertices.filter(function (v) {
-      var incoming = v.incoming || [];
-      return !incoming.some(function (edge) {
-        return edge.source && vertexById[edge.source.id];
-      });
-    });
-
-    // Pure cycle: pick vertex with most outgoing edges
-    if (roots.length === 0) {
-      var bestRoot = vertices[0];
-      var maxOutgoing = -1;
-      vertices.forEach(function (v) {
-        var count = (v.outgoing || []).filter(function (e) {
-          return e.target && vertexById[e.target.id];
-        }).length;
-        if (count > maxOutgoing) { maxOutgoing = count; bestRoot = v; }
-      });
-      roots = [bestRoot];
-    }
-
-    // BFS longest-path layering (guarded against runaway cycles)
-    var visited = {};
-    var queue = [];
-    roots.forEach(function (root) {
-      levels[root.id] = 0;
-      visited[root.id] = true;
-      queue.push(root);
-    });
-
-    var guard = 0, guardMax = vertices.length * vertices.length + 100;
-    while (queue.length > 0 && guard++ < guardMax) {
-      var current = queue.shift();
-      var currentLevel = levels[current.id];
-
-      (current.outgoing || []).forEach(function (edge) {
-        var target = edge.target;
-        if (target && vertexById[target.id]) {
-          if (!visited[target.id]) {
-            visited[target.id] = true;
-            levels[target.id] = currentLevel + 1;
-            maxLevel = Math.max(maxLevel, currentLevel + 1);
-            queue.push(target);
-          } else {
-            var newLevel = currentLevel + 1;
-            if (newLevel > levels[target.id] && newLevel <= vertices.length) {
-              levels[target.id] = newLevel;
-              maxLevel = Math.max(maxLevel, newLevel);
-              queue.push(target);
-            }
-          }
-        }
-      });
-    }
-
-    // Disconnected vertices go to level 0
-    vertices.forEach(function (v) {
-      if (!visited[v.id]) levels[v.id] = 0;
-    });
-
-    // Group by level
-    var levelGroups = {};
-    vertices.forEach(function (v) {
-      var level = levels[v.id] || 0;
-      (levelGroups[level] = levelGroups[level] || []).push(v);
-    });
-
-    // Barycenter sort within each level to reduce crossings
-    Object.keys(levelGroups).forEach(function (level) {
-      var group = levelGroups[level];
-      if (group.length > 1 && parseInt(level) > 0) {
-        var prevLevel = levelGroups[parseInt(level) - 1] || [];
-        var prevPositions = {};
-        prevLevel.forEach(function (v, idx) { prevPositions[v.id] = idx; });
-
-        group.sort(function (a, b) {
-          var aSum = 0, aCount = 0, bSum = 0, bCount = 0;
-          (a.incoming || []).forEach(function (edge) {
-            if (edge.source && prevPositions[edge.source.id] !== undefined) {
-              aSum += prevPositions[edge.source.id]; aCount++;
-            }
-          });
-          (b.incoming || []).forEach(function (edge) {
-            if (edge.source && prevPositions[edge.source.id] !== undefined) {
-              bSum += prevPositions[edge.source.id]; bCount++;
-            }
-          });
-          return (aCount ? aSum / aCount : 0) - (bCount ? bSum / bCount : 0);
-        });
+    // adjacency restricted to this node set
+    var outAdj = {}, inAdj = {};
+    nodes.forEach(function (n) { outAdj[n.id] = []; inAdj[n.id] = []; });
+    edges.forEach(function (e) {
+      if (byId[e.source] && byId[e.target] && e.source !== e.target) {
+        outAdj[e.source].push(e.target);
+        inAdj[e.target].push(e.source);
       }
     });
 
-    // Level dimensions
-    var levelDimensions = {};
-    var totalPrimaryDim = 0;
-    var maxSecondaryDim = 0;
-
-    Object.keys(levelGroups).forEach(function (level) {
-      var group = levelGroups[level];
-      var levelPrimary = 0, levelSecondary = 0;
-
-      group.forEach(function (v, index) {
-        var bounds = v.getBounds();
-        if (isVertical) {
-          levelSecondary += bounds.width + (index > 0 ? siblingPadding : 0);
-          levelPrimary = Math.max(levelPrimary, bounds.height);
+    // ---- 1. break cycles, then longest-path layer over the acyclic graph --
+    // CDH strategies are drawn cyclically (sub-strategy feedback loops), so a
+    // plain longest-path never terminates cleanly. DFS-mark the back-edges
+    // (edges pointing to a node still on the DFS stack) and layer on the rest;
+    // the full edge set is still used later for ordering/alignment.
+    var color = {};
+    nodes.forEach(function (n) { color[n.id] = 0; }); // 0 new, 1 on-stack, 2 done
+    var back = {};
+    // iterative DFS to avoid deep recursion on large canvases
+    function dfsFrom(start) {
+      var stack = [{ id: start, i: 0 }];
+      color[start] = 1;
+      while (stack.length) {
+        var top = stack[stack.length - 1];
+        var adj = outAdj[top.id];
+        if (top.i < adj.length) {
+          var v = adj[top.i++];
+          if (color[v] === 1) back[top.id + '' + v] = true; // back-edge
+          else if (color[v] === 0) { color[v] = 1; stack.push({ id: v, i: 0 }); }
         } else {
-          levelSecondary += bounds.height + (index > 0 ? siblingPadding : 0);
-          levelPrimary = Math.max(levelPrimary, bounds.width);
+          color[top.id] = 2;
+          stack.pop();
         }
+      }
+    }
+    // start at real sources first so most edges keep their forward direction
+    var startIds = nodes.filter(function (n) { return inAdj[n.id].length === 0; })
+      .map(function (n) { return n.id; })
+      .concat(nodes.map(function (n) { return n.id; }));
+    startIds.forEach(function (id) { if (color[id] === 0) dfsFrom(id); });
+
+    var accOut = {}, accIndeg = {};
+    nodes.forEach(function (n) { accOut[n.id] = []; accIndeg[n.id] = 0; });
+    edges.forEach(function (e) {
+      if (byId[e.source] && byId[e.target] && e.source !== e.target &&
+          !back[e.source + '' + e.target]) {
+        accOut[e.source].push(e.target); accIndeg[e.target]++;
+      }
+    });
+
+    var layer = {};
+    nodes.forEach(function (n) { layer[n.id] = 0; });
+    var q = nodes.filter(function (n) { return accIndeg[n.id] === 0; }).map(function (n) { return n.id; });
+    var topo = [];
+    var localIndeg = {};
+    nodes.forEach(function (n) { localIndeg[n.id] = accIndeg[n.id]; });
+    while (q.length) {
+      var id = q.shift();
+      topo.push(id);
+      accOut[id].forEach(function (t) {
+        if (layer[t] < layer[id] + 1) layer[t] = layer[id] + 1;
+        if (--localIndeg[t] === 0) q.push(t);
       });
-
-      levelDimensions[level] = { primary: levelPrimary, secondary: levelSecondary };
-      maxSecondaryDim = Math.max(maxSecondaryDim, levelSecondary);
-    });
-
-    Object.keys(levelDimensions).forEach(function (level, idx) {
-      totalPrimaryDim += levelDimensions[level].primary + (idx > 0 ? levelPadding : 0);
-    });
-
-    var canvas = getCanvasSize();
-    var startX, startY;
-    if (isVertical) {
-      startX = Math.max(50, (canvas.width - maxSecondaryDim) / 2);
-      startY = Math.max(50, (canvas.height - totalPrimaryDim) / 2);
-    } else {
-      startX = Math.max(50, (canvas.width - totalPrimaryDim) / 2);
-      startY = Math.max(50, (canvas.height - maxSecondaryDim) / 2);
     }
 
-    // Position
-    graph.beginUpdate();
+    // group into layers
+    var maxLayer = 0;
+    nodes.forEach(function (n) { if (layer[n.id] > maxLayer) maxLayer = layer[n.id]; });
+    var layers = [];
+    for (var L = 0; L <= maxLayer; L++) layers.push([]);
+    // stable initial order = topo order, then any leftover nodes
+    var placed = {};
+    topo.forEach(function (id) { layers[layer[id]].push(byId[id]); placed[id] = true; });
+    nodes.forEach(function (n) { if (!placed[n.id]) layers[layer[n.id]].push(n); });
 
-    var currentPos = isVertical ? startY : startX;
+    // ---- 2. crossing reduction: median ordering, down + up sweeps ---------
+    function orderIndex(layerArr) {
+      var idx = {};
+      layerArr.forEach(function (n, i) { idx[n.id] = i; });
+      return idx;
+    }
+    function median(vals) {
+      if (!vals.length) return -1;
+      vals.sort(function (a, b) { return a - b; });
+      var m = Math.floor(vals.length / 2);
+      return vals.length % 2 ? vals[m] : (vals[m - 1] + vals[m]) / 2;
+    }
+    function sweep(adj, refLayerIdxOf) {
+      // reorder each layer by median position of neighbours in the reference layer
+      for (var li = 0; li < layers.length; li++) {
+        var refIdx = refLayerIdxOf(li);
+        if (!refIdx) continue;
+        var arr = layers[li];
+        var med = {};
+        arr.forEach(function (n) {
+          var positions = [];
+          adj[n.id].forEach(function (nb) { if (refIdx[nb] !== undefined) positions.push(refIdx[nb]); });
+          med[n.id] = median(positions);
+        });
+        // keep nodes with no neighbours (med = -1) at their current spot
+        var withMed = arr.map(function (n, i) { return { n: n, i: i, m: med[n.id] }; });
+        withMed.sort(function (a, b) {
+          var am = a.m < 0 ? a.i : a.m, bm = b.m < 0 ? b.i : b.m;
+          return am - bm || a.i - b.i;
+        });
+        layers[li] = withMed.map(function (x) { return x.n; });
+      }
+    }
+    var idxCache = layers.map(orderIndex);
+    for (var iter = 0; iter < 4; iter++) {
+      // down: order layer li by neighbours in li-1 (incoming)
+      sweep(inAdj, function (li) { return li > 0 ? orderIndex(layers[li - 1]) : null; });
+      // up: order layer li by neighbours in li+1 (outgoing)
+      sweep(outAdj, function (li) { return li < layers.length - 1 ? orderIndex(layers[li + 1]) : null; });
+    }
 
-    Object.keys(levelGroups).sort(function (a, b) { return parseInt(a) - parseInt(b); }).forEach(function (level) {
-      var group = levelGroups[level];
-      var groupOffset = (maxSecondaryDim - levelDimensions[level].secondary) / 2;
-      var groupStart = (isVertical ? startX : startY) + groupOffset;
+    // ---- 3a. depth coordinate: centre of each layer band ------------------
+    var depthCenter = [];
+    var run = 0;
+    for (var d = 0; d < layers.length; d++) {
+      var thick = 0;
+      layers[d].forEach(function (n) { thick = Math.max(thick, depthSize(n)); });
+      depthCenter[d] = run + thick / 2;
+      run += thick + layerGap;
+    }
 
-      group.forEach(function (v) {
-        var bounds = v.getBounds();
-        var newX, newY;
+    // ---- 3b. cross coordinate: pack, then median-align + separate ---------
+    var cross = {}; // id -> cross-centre
+    layers.forEach(function (arr) {
+      var c = 0;
+      arr.forEach(function (n) {
+        c += crossSize(n) / 2;
+        cross[n.id] = c;
+        c += crossSize(n) / 2 + crossGap;
+      });
+    });
 
-        if (isVertical) {
-          newX = groupStart; newY = currentPos;
-          groupStart += bounds.width + siblingPadding;
-        } else {
-          newX = currentPos; newY = groupStart;
-          groupStart += bounds.height + siblingPadding;
-        }
+    // enforce order + min gap within a layer, anchored near desired positions
+    function separate(arr) {
+      // forward pass
+      for (var i = 1; i < arr.length; i++) {
+        var prev = arr[i - 1], cur = arr[i];
+        var minC = cross[prev.id] + crossSize(prev) / 2 + crossGap + crossSize(cur) / 2;
+        if (cross[cur.id] < minC) cross[cur.id] = minC;
+      }
+    }
+    function alignPass(adjList) {
+      layers.forEach(function (arr) {
+        arr.forEach(function (n) {
+          var positions = [];
+          adjList[n.id].forEach(function (nb) { if (cross[nb] !== undefined) positions.push(cross[nb]); });
+          if (positions.length) cross[n.id] = median(positions);
+        });
+        // re-sort by desired then re-separate so order is preserved & no overlap
+        arr.sort(function (a, b) { return cross[a.id] - cross[b.id]; });
+        separate(arr);
+      });
+    }
+    // alternate down/up alignment a few times so positions propagate both ways
+    for (var a2 = 0; a2 < 6; a2++) {
+      alignPass(inAdj);   // align to parents
+      alignPass(outAdj);  // align to children
+    }
 
-        var dx = newX - bounds.x;
-        var dy = newY - bounds.y;
-        if (dx !== 0 || dy !== 0) {
-          graph.translateVertices(v, [dx, dy]);
+    // ---- 4. map abstract (depth, cross) -> (x, y), collect bounds ---------
+    var positions = {};
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    layers.forEach(function (arr, d) {
+      arr.forEach(function (n) {
+        var cx, cy; // centre
+        if (isVertical) { cx = cross[n.id]; cy = depthCenter[d]; }
+        else { cx = depthCenter[d]; cy = cross[n.id]; }
+        var x = cx - n.w / 2, y = cy - n.h / 2;
+        positions[n.id] = { x: x, y: y };
+        minX = Math.min(minX, x); minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + n.w); maxY = Math.max(maxY, y + n.h);
+      });
+    });
+
+    return { positions: positions, layers: layers.length, bounds: { minX: minX, minY: minY, maxX: maxX, maxY: maxY } };
+  }
+
+  /**
+   * Pure tree layout — same {positions, bounds} contract as
+   * computeLayeredPositions, so the compound framework can use either.
+   * Each vertex is assigned to its first-encountered parent (DAG/cycle safe);
+   * children are centred under their parent, subtrees packed on the cross axis.
+   * Depth stepping is per-node (edge-to-edge + spacing) so one giant enclosure
+   * doesn't inflate every level gap.
+   */
+  function computeTreePositions(nodes, edges, opts) {
+    opts = opts || {};
+    var isVertical = opts.direction === 'vertical';
+    var spacing = opts.spacing || 60;
+    var siblingPadding = spacing;
+
+    var byId = {};
+    nodes.forEach(function (n) { byId[n.id] = n; });
+    function depthSize(n) { return isVertical ? n.h : n.w; }
+    function crossSize(n) { return isVertical ? n.w : n.h; }
+
+    var outAdj = {}, inAdj = {};
+    nodes.forEach(function (n) { outAdj[n.id] = []; inAdj[n.id] = []; });
+    edges.forEach(function (e) {
+      if (byId[e.source] && byId[e.target] && e.source !== e.target) {
+        outAdj[e.source].push(e.target); inAdj[e.target].push(e.source);
+      }
+    });
+
+    // children via BFS, each node assigned to the first parent encountered
+    var children = {};
+    nodes.forEach(function (n) { children[n.id] = []; });
+    var assigned = {};
+    var roots = nodes.filter(function (n) { return inAdj[n.id].length === 0; }).map(function (n) { return n.id; });
+    if (!roots.length) {
+      var best = nodes[0].id, mx = -1;
+      nodes.forEach(function (n) { if (outAdj[n.id].length > mx) { mx = outAdj[n.id].length; best = n.id; } });
+      roots = [best];
+    }
+    var queue = roots.slice();
+    roots.forEach(function (r) { assigned[r] = true; });
+    while (queue.length) {
+      var c = queue.shift();
+      outAdj[c].forEach(function (t) {
+        if (!assigned[t]) { assigned[t] = true; children[c].push(t); queue.push(t); }
+      });
+    }
+    nodes.forEach(function (n) { if (!assigned[n.id]) { assigned[n.id] = true; roots.push(n.id); } });
+
+    // subtree cross-extent, cycle-guarded
+    var sw = {}, calc = {};
+    function csw(id) {
+      if (sw[id] !== undefined) return sw[id];
+      if (calc[id]) return crossSize(byId[id]);
+      calc[id] = true;
+      var cl = children[id];
+      if (!cl.length) sw[id] = crossSize(byId[id]);
+      else {
+        var tot = 0;
+        cl.forEach(function (ch) { tot += csw(ch) + siblingPadding; });
+        tot -= siblingPadding;
+        sw[id] = Math.max(tot, crossSize(byId[id]));
+      }
+      calc[id] = false;
+      return sw[id];
+    }
+    roots.forEach(csw);
+
+    var pc = {};
+    var positioned = {};
+    function pos(id, p, c) {
+      if (positioned[id]) return;
+      positioned[id] = true;
+      pc[id] = { p: p, c: c };
+      var cl = children[id];
+      if (!cl.length) return;
+      var start = c - sw[id] / 2;
+      var childPrimary = p + depthSize(byId[id]) / 2 + spacing;
+      cl.forEach(function (ch) {
+        var cw = sw[ch] || crossSize(byId[ch]);
+        pos(ch, childPrimary + depthSize(byId[ch]) / 2, start + cw / 2);
+        start += cw + siblingPadding;
+      });
+    }
+    var totalRoots = 0;
+    roots.forEach(function (r) { totalRoots += (sw[r] || spacing) + spacing * 2; });
+    totalRoots -= spacing * 2;
+    var rootStart = -totalRoots / 2;
+    roots.forEach(function (r) {
+      var rw = sw[r] || spacing;
+      pos(r, 0, rootStart + rw / 2);
+      rootStart += rw + spacing * 2;
+    });
+
+    var positions = {};
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach(function (n) {
+      var q = pc[n.id] || { p: 0, c: 0 };
+      var cx, cy;
+      if (isVertical) { cx = q.c; cy = q.p; } else { cx = q.p; cy = q.c; }
+      var x = cx - n.w / 2, y = cy - n.h / 2;
+      positions[n.id] = { x: x, y: y };
+      minX = Math.min(minX, x); minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + n.w); maxY = Math.max(maxY, y + n.h);
+    });
+    return { positions: positions, layers: 0, bounds: { minX: minX, minY: minY, maxX: maxX, maxY: maxY } };
+  }
+
+  /**
+   * Compound (nested) layout for enclosure shapes.
+   *
+   * CDH strategies use "Context" enclosures (e.g. Customers, Agreements) that
+   * visually wrap child shapes; membership lives on vertex.contents (an object
+   * map, not the model parent tree — every shape's parent is the root). The old
+   * flat layout tore contents out of their enclosure. This lays out each
+   * enclosure's interior with the layered algorithm, sizes the enclosure to fit,
+   * then lays out the parent level treating enclosures as single big nodes.
+   *
+   * contents: { containerId: [childId, ...] } (a child may itself be a container)
+   * Returns { abs: {id:{x,y,w,h}}, fitted, topLevel, containerOf }.
+   * Generalises the flat case: with no containers it reduces to one layered pass.
+   */
+  function computeCompoundLayout(nodes, edges, contents, opts) {
+    opts = opts || {};
+    var HEADER = opts.header != null ? opts.header : 50;
+    var PAD = opts.pad != null ? opts.pad : 30;
+    var spacing = opts.spacing || 60;
+    var dir = opts.direction || 'horizontal';
+
+    var byId = {};
+    nodes.forEach(function (n) { byId[n.id] = n; });
+    function isContainer(id) { return contents[id] && contents[id].length > 0; }
+
+    var containerOf = {};
+    Object.keys(contents).forEach(function (cid) {
+      contents[cid].forEach(function (m) { containerOf[m] = cid; });
+    });
+    var topLevel = nodes.filter(function (n) { return !containerOf[n.id]; }).map(function (n) { return n.id; });
+
+    var fitted = {};
+    var rel = {};
+
+    function ancestorInGroup(id, memberSet) {
+      var cur = id, guard = 0;
+      while (cur && guard++ < 1000) {
+        if (memberSet[cur]) return cur;
+        cur = containerOf[cur];
+      }
+      return null;
+    }
+
+    function layoutGroup(memberIds) {
+      var memberSet = {};
+      memberIds.forEach(function (id) { memberSet[id] = true; });
+      // recurse into container members FIRST (bottom-up) so parents lay them
+      // out at fitted size, not the raw enclosure size.
+      memberIds.forEach(function (id) {
+        if (isContainer(id) && !fitted[id]) {
+          var innerC = layoutGroup(contents[id]);
+          fitted[id] = { w: innerC.w + 2 * PAD, h: innerC.h + HEADER + PAD };
         }
       });
 
-      currentPos += levelDimensions[level].primary + levelPadding;
+      var localNodes = memberIds.map(function (id) {
+        var sz = fitted[id] || { w: byId[id].w, h: byId[id].h };
+        return { id: id, w: sz.w, h: sz.h };
+      });
+      var seen = {}, localEdges = [];
+      edges.forEach(function (e) {
+        var s = ancestorInGroup(e.source, memberSet), t = ancestorInGroup(e.target, memberSet);
+        if (s && t && s !== t) {
+          var k = s + '' + t;
+          if (!seen[k]) { seen[k] = true; localEdges.push({ source: s, target: t }); }
+        }
+      });
+
+      var layoutFn = opts.layoutFn || computeLayeredPositions;
+      var res = layoutFn(localNodes, localEdges, { direction: dir, spacing: spacing });
+      memberIds.forEach(function (id) {
+        rel[id] = { x: res.positions[id].x - res.bounds.minX, y: res.positions[id].y - res.bounds.minY };
+      });
+      return { w: res.bounds.maxX - res.bounds.minX, h: res.bounds.maxY - res.bounds.minY };
+    }
+
+    layoutGroup(topLevel);
+
+    var abs = {};
+    function place(memberIds, ox, oy) {
+      memberIds.forEach(function (id) {
+        var ax = ox + rel[id].x, ay = oy + rel[id].y;
+        var sz = fitted[id] || byId[id];
+        abs[id] = { x: ax, y: ay, w: sz.w, h: sz.h };
+        if (isContainer(id)) place(contents[id], ax + PAD, ay + HEADER);
+      });
+    }
+    place(topLevel, 0, 0);
+
+    return { abs: abs, fitted: fitted, topLevel: topLevel, containerOf: containerOf, isContainer: isContainer };
+  }
+
+  // Normalise a vertex.contents / .children value (array | object-map | Set)
+  // into an array of member ids that exist in idSet.
+  function memberIds(x, idSet) {
+    var out = [];
+    if (!x) return out;
+    function push(v) { var id = v && v.id; if (id && idSet[id]) out.push(id); }
+    if (Array.isArray(x)) x.forEach(push);
+    else if (typeof x.forEach === 'function') x.forEach(push);
+    else if (typeof x === 'object') Object.keys(x).forEach(function (k) { push(x[k]); });
+    return out;
+  }
+
+  function applyCompound(graph, vertices, direction, spacing, layoutFn, label) {
+    if (vertices.length === 0) return { success: false, message: 'No vertices to arrange' };
+
+    var idSet = {};
+    vertices.forEach(function (v) { idSet[v.id] = true; });
+
+    // snapshot sizes, edges, and enclosure membership from the live graph
+    var nodes = vertices.map(function (v) {
+      var b = v.getBounds();
+      return { id: v.id, w: b.width, h: b.height };
+    });
+    var edges = [];
+    vertices.forEach(function (v) {
+      (v.outgoing || []).forEach(function (e) {
+        if (e.target && idSet[e.target.id]) edges.push({ source: v.id, target: e.target.id });
+      });
+    });
+    var contents = {};
+    var enclosureCount = 0;
+    vertices.forEach(function (v) {
+      var m = memberIds(v.contents, idSet);
+      if (m.length) { contents[v.id] = m; enclosureCount++; }
     });
 
+    var res = computeCompoundLayout(nodes, edges, contents, { direction: direction, spacing: spacing, layoutFn: layoutFn });
+
+    // centre the whole thing on the canvas
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    Object.keys(res.abs).forEach(function (id) {
+      var a = res.abs[id];
+      minX = Math.min(minX, a.x); minY = Math.min(minY, a.y);
+      maxX = Math.max(maxX, a.x + a.w); maxY = Math.max(maxY, a.y + a.h);
+    });
+    var canvas = getCanvasSize();
+    var offX = Math.max(50, (canvas.width - (maxX - minX)) / 2) - minX;
+    var offY = Math.max(50, (canvas.height - (maxY - minY)) / 2) - minY;
+
+    // Apply parents BEFORE children: moving an enclosure may drag its members,
+    // so we set the enclosure first, then re-derive each child's delta from its
+    // (possibly shifted) live bounds. Enclosures auto-grow around their contents.
+    var vById = {};
+    vertices.forEach(function (v) { vById[v.id] = v; });
+
+    graph.beginUpdate();
+    function apply(memberList) {
+      memberList.forEach(function (id) {
+        var v = vById[id], target = res.abs[id];
+        if (v && target) {
+          var b = v.getBounds();
+          var dx = (target.x + offX) - b.x, dy = (target.y + offY) - b.y;
+          if (dx !== 0 || dy !== 0) graph.translateVertices(v, [dx, dy]);
+        }
+        if (res.isContainer(id)) apply(contents[id]);
+      });
+    }
+    apply(res.topLevel);
     graph.endUpdate();
 
     return {
       success: true,
-      message: 'Hierarchical layout applied (' + direction + ')',
-      levels: maxLevel + 1,
+      message: (label || 'Layout') + ' applied (' + direction + ')' +
+        (enclosureCount ? ' — ' + enclosureCount + ' enclosure(s) nested' : ''),
       componentsArranged: vertices.length
     };
   }
@@ -267,200 +579,11 @@
   // ------------------------------------------------------------ tree layout
 
   /**
-   * Tree layout - arranges vertices in a tree structure with centered children.
-   * DAG-safe (one parent per vertex) and cycle-safe.
+   * Tree layout — thin wrapper over the compound framework using the pure
+   * tree positioner, so enclosures nest exactly like the hierarchical layout.
    */
   function applyTreeLayout(graph, vertices, direction, spacing) {
-    console.log('[applyTreeLayout] Direction:', direction, 'Spacing:', spacing);
-
-    if (vertices.length === 0) {
-      return { success: false, message: 'No vertices to arrange' };
-    }
-
-    var isVertical = direction === 'vertical';
-    var siblingPadding = spacing;
-
-    // Level step is center-to-center, so it must clear the widest (horizontal)
-    // or tallest (vertical) node — a fixed spacing*2 made wide shapes overlap
-    // in left-to-right mode.
-    var maxPrimaryDim = 0;
-    vertices.forEach(function (v) {
-      var b = v.getBounds();
-      maxPrimaryDim = Math.max(maxPrimaryDim, isVertical ? b.height : b.width);
-    });
-    var levelPadding = maxPrimaryDim + spacing;
-
-    var vertexById = {};
-    vertices.forEach(function (v) { vertexById[v.id] = v; });
-
-    var children = {};
-    var assignedToTree = {};
-    vertices.forEach(function (v) { children[v.id] = []; });
-
-    var roots = vertices.filter(function (v) {
-      var incoming = v.incoming || [];
-      return !incoming.some(function (edge) {
-        return edge.source && vertexById[edge.source.id];
-      });
-    });
-
-    if (roots.length === 0) {
-      var bestRoot = vertices[0];
-      var maxOutgoing = -1;
-      vertices.forEach(function (v) {
-        var count = (v.outgoing || []).filter(function (e) {
-          return e.target && vertexById[e.target.id];
-        }).length;
-        if (count > maxOutgoing) { maxOutgoing = count; bestRoot = v; }
-      });
-      roots = [bestRoot];
-    }
-
-    // BFS: each vertex belongs to the first parent encountered
-    var queue = roots.slice();
-    roots.forEach(function (root) { assignedToTree[root.id] = true; });
-
-    while (queue.length > 0) {
-      var current = queue.shift();
-      (current.outgoing || []).forEach(function (edge) {
-        var target = edge.target;
-        if (target && vertexById[target.id] && !assignedToTree[target.id]) {
-          assignedToTree[target.id] = true;
-          children[current.id].push(target);
-          queue.push(target);
-        }
-      });
-    }
-
-    // Disconnected vertices become extra roots
-    vertices.forEach(function (v) {
-      if (!assignedToTree[v.id]) {
-        assignedToTree[v.id] = true;
-        roots.push(v);
-      }
-    });
-
-    // Subtree widths with cycle protection
-    var subtreeWidth = {};
-    var calculating = {};
-
-    function calcSubtreeWidth(v) {
-      if (subtreeWidth[v.id] !== undefined) return subtreeWidth[v.id];
-      if (calculating[v.id]) {
-        var b = v.getBounds();
-        return isVertical ? b.width : b.height;
-      }
-      calculating[v.id] = true;
-
-      var childList = children[v.id] || [];
-      if (childList.length === 0) {
-        var bounds = v.getBounds();
-        subtreeWidth[v.id] = isVertical ? bounds.width : bounds.height;
-      } else {
-        var totalWidth = 0;
-        childList.forEach(function (child) {
-          totalWidth += calcSubtreeWidth(child) + siblingPadding;
-        });
-        totalWidth -= siblingPadding;
-        subtreeWidth[v.id] = Math.max(totalWidth,
-          isVertical ? v.getBounds().width : v.getBounds().height);
-      }
-
-      calculating[v.id] = false;
-      return subtreeWidth[v.id];
-    }
-
-    roots.forEach(function (root) { calcSubtreeWidth(root); });
-
-    graph.beginUpdate();
-
-    var positioned = {};
-
-    function positionSubtree(v, x, y, level) {
-      if (positioned[v.id]) return;
-      positioned[v.id] = true;
-
-      var bounds = v.getBounds();
-      var dx = x - bounds.getCenterX();
-      var dy = y - bounds.getCenterY();
-      if (dx !== 0 || dy !== 0) {
-        graph.translateVertices(v, [dx, dy]);
-      }
-
-      var childList = children[v.id] || [];
-      if (childList.length === 0) return;
-
-      var totalChildWidth = subtreeWidth[v.id];
-      var childStartOffset = -totalChildWidth / 2;
-
-      childList.forEach(function (child) {
-        var childWidth = subtreeWidth[child.id] || siblingPadding;
-        var childOffset = childStartOffset + childWidth / 2;
-
-        var childX, childY;
-        if (isVertical) {
-          childX = x + childOffset;
-          childY = y + levelPadding;
-        } else {
-          childX = x + levelPadding;
-          childY = y + childOffset;
-        }
-
-        positionSubtree(child, childX, childY, level + 1);
-        childStartOffset += childWidth + siblingPadding;
-      });
-    }
-
-    var totalRootsWidth = 0;
-    roots.forEach(function (root) {
-      totalRootsWidth += (subtreeWidth[root.id] || spacing) + spacing * 2;
-    });
-    totalRootsWidth -= spacing * 2;
-
-    var maxDepth = 0;
-    function calcDepth(v, depth, visitedDepth) {
-      if (visitedDepth[v.id]) return;
-      visitedDepth[v.id] = true;
-      maxDepth = Math.max(maxDepth, depth);
-      (children[v.id] || []).forEach(function (child) {
-        calcDepth(child, depth + 1, visitedDepth);
-      });
-    }
-    var depthVisited = {};
-    roots.forEach(function (root) { calcDepth(root, 0, depthVisited); });
-
-    var totalPrimaryDim = maxDepth * levelPadding + maxPrimaryDim;
-
-    var canvas = getCanvasSize();
-    var startX, startY;
-    if (isVertical) {
-      startX = Math.max(100, canvas.width / 2);
-      startY = Math.max(80, (canvas.height - totalPrimaryDim) / 2);
-    } else {
-      startX = Math.max(80, (canvas.width - totalPrimaryDim) / 2);
-      startY = Math.max(100, canvas.height / 2);
-    }
-
-    var rootOffset = -totalRootsWidth / 2;
-
-    roots.forEach(function (root) {
-      var rootWidth = subtreeWidth[root.id] || spacing;
-      if (isVertical) {
-        positionSubtree(root, startX + rootOffset + rootWidth / 2, startY, 0);
-      } else {
-        positionSubtree(root, startX, startY + rootOffset + rootWidth / 2, 0);
-      }
-      rootOffset += rootWidth + spacing * 2;
-    });
-
-    graph.endUpdate();
-
-    return {
-      success: true,
-      message: 'Tree layout applied (' + direction + ')',
-      roots: roots.length,
-      componentsArranged: vertices.length
-    };
+    return applyCompound(graph, vertices, direction, spacing, computeTreePositions, 'Tree layout');
   }
 
   // ------------------------------------------------------------------ UI
@@ -581,4 +704,11 @@
       buildPanel();
     }
   }, 1500);
+
+  // Exposed so the layout math can be unit-tested off-DOM (node/console).
+  try {
+    window.__pcalCompute = computeLayeredPositions;
+    window.__pcalTree = computeTreePositions;
+    window.__pcalCompound = computeCompoundLayout;
+  } catch (e) { /* ignore */ }
 })();
