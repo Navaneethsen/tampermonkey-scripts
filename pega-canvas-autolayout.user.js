@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pega Strategy Canvas Auto-Layout
 // @namespace    navaneethsen@gmail.com
-// @version      1.0
+// @version      1.7
 // @description  Adds hierarchical / tree layout buttons to the Pega strategy canvas (Dev Studio)
 // @match        *://*/prweb/*
 // @grant        none
@@ -145,7 +145,7 @@
         var adj = outAdj[top.id];
         if (top.i < adj.length) {
           var v = adj[top.i++];
-          if (color[v] === 1) back[top.id + '' + v] = true; // back-edge
+          if (color[v] === 1) back[top.id + ' ' + v] = true; // back-edge
           else if (color[v] === 0) { color[v] = 1; stack.push({ id: v, i: 0 }); }
         } else {
           color[top.id] = 2;
@@ -163,7 +163,7 @@
     nodes.forEach(function (n) { accOut[n.id] = []; accIndeg[n.id] = 0; });
     edges.forEach(function (e) {
       if (byId[e.source] && byId[e.target] && e.source !== e.target &&
-          !back[e.source + '' + e.target]) {
+          !back[e.source + ' ' + e.target]) {
         accOut[e.source].push(e.target); accIndeg[e.target]++;
       }
     });
@@ -226,7 +226,6 @@
         layers[li] = withMed.map(function (x) { return x.n; });
       }
     }
-    var idxCache = layers.map(orderIndex);
     for (var iter = 0; iter < 4; iter++) {
       // down: order layer li by neighbours in li-1 (incoming)
       sweep(inAdj, function (li) { return li > 0 ? orderIndex(layers[li - 1]) : null; });
@@ -281,6 +280,39 @@
       alignPass(inAdj);   // align to parents
       alignPass(outAdj);  // align to children
     }
+
+    // Stagger alternate layers on the cross axis. The aligner makes chains
+    // perfectly straight, which reads well until several links share the line:
+    // skip-edges, parallel runs, and dotted refs all collapse onto one stroke.
+    // A half-spacing offset on every odd layer gives every segment its own
+    // slope, so no two links are ever exactly collinear.
+    var stagger = crossGap / 2;
+    layers.forEach(function (arr, d) {
+      if (d % 2 === 1) {
+        arr.forEach(function (n) { cross[n.id] += stagger; });
+      }
+    });
+
+    // De-collinearize dotted Reference links: when a ref edge's endpoints end
+    // up on the same cross line as the flow (single-pipeline strategies put
+    // EVERYTHING on one line), the dotted link is drawn exactly over the solid
+    // connectors and is unreadable. Nudge the ref SOURCE off the line
+    // (alternating sides), then re-separate each layer so nothing overlaps.
+    var refs = opts.refEdges || [];
+    var flip = 1;
+    refs.forEach(function (e) {
+      if (cross[e.source] === undefined || cross[e.target] === undefined) return;
+      if (Math.abs(cross[e.source] - cross[e.target]) > 1) return; // already split
+      var n = byId[e.source];
+      cross[e.source] += flip * (crossSize(n) / 2 + crossGap);
+      flip = -flip;
+    });
+
+    // restore in-layer order + minimum gaps after the offsets
+    layers.forEach(function (arr) {
+      arr.sort(function (a, b) { return cross[a.id] - cross[b.id]; });
+      separate(arr);
+    });
 
     // ---- 4. map abstract (depth, cross) -> (x, y), collect bounds ---------
     var positions = {};
@@ -453,11 +485,17 @@
       var memberSet = {};
       memberIds.forEach(function (id) { memberSet[id] = true; });
       // recurse into container members FIRST (bottom-up) so parents lay them
-      // out at fitted size, not the raw enclosure size.
+      // out at fitted size, not the raw enclosure size. The fitted size is at
+      // least the LIVE measured size: Pega may render the enclosure bigger
+      // than interior+padding (its own chrome), and siblings must clear the
+      // real box or the enclosure visually covers them.
       memberIds.forEach(function (id) {
         if (isContainer(id) && !fitted[id]) {
           var innerC = layoutGroup(contents[id]);
-          fitted[id] = { w: innerC.w + 2 * PAD, h: innerC.h + HEADER + PAD };
+          fitted[id] = {
+            w: Math.max(innerC.w + 2 * PAD, byId[id].w),
+            h: Math.max(innerC.h + HEADER + PAD, byId[id].h)
+          };
         }
       });
 
@@ -465,17 +503,22 @@
         var sz = fitted[id] || { w: byId[id].w, h: byId[id].h };
         return { id: id, w: sz.w, h: sz.h };
       });
-      var seen = {}, localEdges = [];
-      edges.forEach(function (e) {
-        var s = ancestorInGroup(e.source, memberSet), t = ancestorInGroup(e.target, memberSet);
-        if (s && t && s !== t) {
-          var k = s + '' + t;
-          if (!seen[k]) { seen[k] = true; localEdges.push({ source: s, target: t }); }
-        }
-      });
+      function toLocal(edgeList) {
+        var seen = {}, out = [];
+        edgeList.forEach(function (e) {
+          var s = ancestorInGroup(e.source, memberSet), t = ancestorInGroup(e.target, memberSet);
+          if (s && t && s !== t) {
+            var k = s + ' ' + t;
+            if (!seen[k]) { seen[k] = true; out.push({ source: s, target: t }); }
+          }
+        });
+        return out;
+      }
+      var localEdges = toLocal(edges);
+      var localRefs = toLocal(opts.refEdges || []);
 
       var layoutFn = opts.layoutFn || computeLayeredPositions;
-      var res = layoutFn(localNodes, localEdges, { direction: dir, spacing: spacing });
+      var res = layoutFn(localNodes, localEdges, { direction: dir, spacing: spacing, refEdges: localRefs });
       memberIds.forEach(function (id) {
         rel[id] = { x: res.positions[id].x - res.bounds.minX, y: res.positions[id].y - res.bounds.minY };
       });
@@ -510,21 +553,81 @@
     return out;
   }
 
+  // Both live-unverified enclosure mutations sit behind flags after a v1.5
+  // field failure (giant empty enclosure boxes, shapes scattered, orphan
+  // links): growVertices' signature is inferred, and expandVertex restores the
+  // stored expandedState geometry, both of which can fight the layout.
+  // Verify each with a console probe before turning back on.
+  var ENABLE_ENCLOSURE_RESIZE = false; // graph.growVertices([dw,dh]) — unverified
+  var ENABLE_ENCLOSURE_EXPAND = true;  // expandVertex/expand on cfg.expanded===false
+
   function applyCompound(graph, vertices, direction, spacing, layoutFn, label) {
     if (vertices.length === 0) return { success: false, message: 'No vertices to arrange' };
 
     var idSet = {};
     vertices.forEach(function (v) { idSet[v.id] = true; });
+    var vById = {};
+    vertices.forEach(function (v) { vById[v.id] = v; });
+    var expandedOnce = {}; // one expand per vertex per layout run — never re-fire on pass 2
 
-    // snapshot sizes, edges, and enclosure membership from the live graph
-    var nodes = vertices.map(function (v) {
-      var b = v.getBounds();
-      return { id: v.id, w: b.width, h: b.height };
-    });
-    var edges = [];
+    // Expand collapsed enclosures. cfg.expanded is the authoritative state
+    // (confirmed live on a Context enclosure: cfg has expanded/collapsedState/
+    // expandedState). Only call expand() when expanded === false so an open
+    // enclosure is never touched (in case expand semantics toggle). Falls back
+    // to a geometry heuristic when the cfg flag is absent. Runs at the start
+    // of EVERY pass so a re-render that re-collapses between passes is undone.
+    function expandEnclosures() {
+      if (!ENABLE_ENCLOSURE_EXPAND) return 0;
+      var count = 0;
+      vertices.forEach(function (v) {
+        if (expandedOnce[v.id]) return; // even if cfg.expanded didn't flip, don't double-fire
+        var m = memberIds(v.contents, idSet);
+        if (!m.length) return;
+        var needsExpand;
+        var flag = v.cfg && typeof v.cfg.expanded === 'boolean' ? v.cfg.expanded : null;
+        if (flag !== null) {
+          needsExpand = flag === false;
+        } else {
+          // no cfg flag: expand when a member is invisible (hidden by collapse)
+          needsExpand = m.some(function (id) {
+            var mv = vById[id];
+            try { return !!(mv && mv.isVisible && mv.isVisible() === false); }
+            catch (e) { return false; }
+          });
+        }
+        if (!needsExpand) return;
+        expandedOnce[v.id] = true;
+        try {
+          if (typeof graph.expandVertex === 'function') graph.expandVertex(v);
+          else if (typeof v.expand === 'function') v.expand();
+          count++;
+        } catch (e) {
+          try { if (typeof v.expand === 'function') { v.expand(); count++; } } catch (e2) { /* non-fatal */ }
+        }
+      });
+      if (count) console.log('[canvas-layout] expanded ' + count + ' enclosure(s)');
+      return count;
+    }
+
+    // Split edges by type (confirmed live: 'Inheritance' = solid flow,
+    // 'Reference' = dotted link). Reference links are NOT execution flow:
+    // layering on them drags targets into fake layers and draws the dotted
+    // line exactly over the straight connectors. Flow edges drive the layout;
+    // ref edges are passed separately so the layout can de-collinearize their
+    // endpoints (nudge the source off the flow line, making the dotted link a
+    // visible diagonal instead of an overlay).
+    var edges = [], refEdges = [];
     vertices.forEach(function (v) {
       (v.outgoing || []).forEach(function (e) {
-        if (e.target && idSet[e.target.id]) edges.push({ source: v.id, target: e.target.id });
+        if (!e.target || !idSet[e.target.id]) return;
+        var kind = '';
+        try {
+          kind = String((e.type && (e.type.name || e.type)) ||
+                        (e.cfg && (e.cfg.type || e.cfg.category)) || '');
+        } catch (ex) { /* treat as flow */ }
+        var rec = { source: v.id, target: e.target.id };
+        if (/ref/i.test(kind)) refEdges.push(rec);
+        else edges.push(rec);
       });
     });
     var contents = {};
@@ -534,39 +637,84 @@
       if (m.length) { contents[v.id] = m; enclosureCount++; }
     });
 
-    var res = computeCompoundLayout(nodes, edges, contents, { direction: direction, spacing: spacing, layoutFn: layoutFn });
+    // One full snapshot -> compute -> apply cycle. Bounds are re-read from the
+    // live graph each call, so a second pass sees the REAL enclosure sizes
+    // after Pega re-wrapped them around the moved children (pass 1 works from
+    // pre-layout guesses; pass 2 corrects any enclosure that rendered bigger
+    // than assumed and was covering its neighbours).
+    function runPass() {
+      expandEnclosures(); // reopen anything collapsed (or re-collapsed by a re-render)
 
-    // centre the whole thing on the canvas
-    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    Object.keys(res.abs).forEach(function (id) {
-      var a = res.abs[id];
-      minX = Math.min(minX, a.x); minY = Math.min(minY, a.y);
-      maxX = Math.max(maxX, a.x + a.w); maxY = Math.max(maxY, a.y + a.h);
-    });
-    var canvas = getCanvasSize();
-    var offX = Math.max(50, (canvas.width - (maxX - minX)) / 2) - minX;
-    var offY = Math.max(50, (canvas.height - (maxY - minY)) / 2) - minY;
-
-    // Apply parents BEFORE children: moving an enclosure may drag its members,
-    // so we set the enclosure first, then re-derive each child's delta from its
-    // (possibly shifted) live bounds. Enclosures auto-grow around their contents.
-    var vById = {};
-    vertices.forEach(function (v) { vById[v.id] = v; });
-
-    graph.beginUpdate();
-    function apply(memberList) {
-      memberList.forEach(function (id) {
-        var v = vById[id], target = res.abs[id];
-        if (v && target) {
-          var b = v.getBounds();
-          var dx = (target.x + offX) - b.x, dy = (target.y + offY) - b.y;
-          if (dx !== 0 || dy !== 0) graph.translateVertices(v, [dx, dy]);
-        }
-        if (res.isContainer(id)) apply(contents[id]);
+      var nodes = vertices.map(function (v) {
+        var b = v.getBounds();
+        return { id: v.id, w: b.width, h: b.height };
       });
+
+      var res = computeCompoundLayout(nodes, edges, contents, { direction: direction, spacing: spacing, layoutFn: layoutFn, refEdges: refEdges });
+
+      // centre the whole thing on the canvas
+      var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      Object.keys(res.abs).forEach(function (id) {
+        var a = res.abs[id];
+        minX = Math.min(minX, a.x); minY = Math.min(minY, a.y);
+        maxX = Math.max(maxX, a.x + a.w); maxY = Math.max(maxY, a.y + a.h);
+      });
+      var canvas = getCanvasSize();
+      var offX = Math.max(50, (canvas.width - (maxX - minX)) / 2) - minX;
+      var offY = Math.max(50, (canvas.height - (maxY - minY)) / 2) - minY;
+
+      // Apply parents BEFORE children: moving an enclosure may drag its
+      // members, so set the enclosure first, then re-derive each child's delta
+      // from its (possibly shifted) live bounds.
+      //
+      // Enclosures do NOT auto-wrap around their children (confirmed live:
+      // cfg.expanded true yet box stayed 270x240 with children far outside),
+      // so containers are explicitly RESIZED to the fitted layout box via
+      // growVertices — the resize sibling of translateVertices.
+      graph.beginUpdate();
+      function apply(memberList) {
+        memberList.forEach(function (id) {
+          var v = vById[id], target = res.abs[id];
+          if (v && target) {
+            var b = v.getBounds();
+            var dx = (target.x + offX) - b.x, dy = (target.y + offY) - b.y;
+            if (dx !== 0 || dy !== 0) graph.translateVertices(v, [dx, dy]);
+            if (res.isContainer(id) && ENABLE_ENCLOSURE_RESIZE) {
+              try {
+                var bb = v.getBounds();
+                var dw = target.w - bb.width, dh = target.h - bb.height;
+                if (dw !== 0 || dh !== 0) {
+                  if (typeof graph.growVertices === 'function') graph.growVertices(v, [dw, dh]);
+                  else if (typeof graph.growVertex === 'function') graph.growVertex(v, [dw, dh]);
+                }
+              } catch (e) { console.log('[canvas-layout] enclosure resize failed for ' + id + ':', e); }
+            }
+          }
+          if (res.isContainer(id)) apply(contents[id]);
+        });
+      }
+      apply(res.topLevel);
+      graph.endUpdate();
     }
-    apply(res.topLevel);
-    graph.endUpdate();
+
+    runPass();
+    runPass(); // second pass re-reads live bounds (now-resized enclosures)
+
+    // Post-layout render refresh: children were moved with translateVertices,
+    // but the enclosure's internal rendering only settles after a collapse/
+    // expand cycle (user-verified: manually closing and reopening the
+    // enclosure "fixes the form"). Mimic that exact cycle programmatically on
+    // every open enclosure.
+    vertices.forEach(function (v) {
+      if (!memberIds(v.contents, idSet).length) return;
+      if (v.cfg && v.cfg.expanded === false) return; // still collapsed: leave it
+      try {
+        if (typeof v.collapse === 'function' && typeof v.expand === 'function') {
+          v.collapse();
+          v.expand();
+        }
+      } catch (e) { /* non-fatal: layout already applied */ }
+    });
 
     return {
       success: true,
@@ -589,6 +737,7 @@
   // ------------------------------------------------------------------ UI
 
   var PANEL_ID = 'tm-canvas-layout-panel';
+  var panelHidden = false; // set by the × button; poll respects it until reload
 
   function runLayout(kind, direction) {
     var viewer = getViewer();
@@ -686,7 +835,10 @@
     fitBtn.style.background = '#7f8c8d';
     panel.appendChild(fitBtn);
 
-    var hideBtn = mkBtn('×', 'Hide panel', function () { panel.remove(); });
+    var hideBtn = mkBtn('×', 'Hide panel (until page reload)', function () {
+      panelHidden = true; // stop the poll from resurrecting it
+      panel.remove();
+    });
     hideBtn.style.cssText = btnStyle + 'background:transparent;font-size:14px;padding:2px 4px;';
     panel.appendChild(hideBtn);
 
@@ -698,6 +850,7 @@
   // after async load and can be torn down/recreated on tab switches, so keep
   // polling: add the panel when a viewer exists, drop it when it goes away.
   setInterval(function () {
+    if (panelHidden) return;
     var viewer = getViewer();
     var panel = document.getElementById(PANEL_ID);
     if (viewer && !panel && document.querySelector('.gfw-canvas svg')) {
@@ -710,5 +863,6 @@
     window.__pcalCompute = computeLayeredPositions;
     window.__pcalTree = computeTreePositions;
     window.__pcalCompound = computeCompoundLayout;
+    window.__pcalApply = applyCompound;
   } catch (e) { /* ignore */ }
 })();
